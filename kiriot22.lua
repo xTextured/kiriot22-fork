@@ -1,7 +1,7 @@
--- || This is a modified fork of Kiriot22's ESP library ||
--- || Features from Sense ESP (3D Boxes, Health Bar, Health Text) have been integrated. ||
--- || ADDED: Proximity-based Highlight ESP with a controllable budget. ||
--- || ADDED: Separate settings for Players and Instances. ||
+-- || Enhanced ESP Library - Fork with Dynamic Names & Existing Object Detection ||
+-- || Based on Kiriot22's ESP library with Sense ESP features ||
+-- || NEW: Dynamic name updates via NameDynamic callback ||
+-- || NEW: AddObjectListener now processes existing objects ||
 
 --Services--
 local RunService = game:GetService("RunService")
@@ -191,6 +191,7 @@ function ESP:AddObjectListener(parent, options)
                         Color = type(options.Color) == "function" and options.Color(c) or options.Color,
                         ColorDynamic = options.ColorDynamic,
                         Name = type(options.CustomName) == "function" and options.CustomName(c) or options.CustomName,
+                        NameDynamic = options.NameDynamic, -- NEW: Dynamic name callback
                         IsEnabled = options.IsEnabled,
                         RenderInNil = options.RenderInNil
                     })
@@ -201,16 +202,18 @@ function ESP:AddObjectListener(parent, options)
             end
         end
     end
+    
+    -- NEW: Process existing objects first
     if options.Recursive then
-        parent.DescendantAdded:Connect(NewListener)
         for i, v in pairs(parent:GetDescendants()) do
             coroutine.wrap(NewListener)(v)
         end
+        parent.DescendantAdded:Connect(NewListener)
     else
-        parent.ChildAdded:Connect(NewListener)
         for i, v in pairs(parent:GetChildren()) do
             coroutine.wrap(NewListener)(v)
         end
+        parent.ChildAdded:Connect(NewListener)
     end
 end
 
@@ -232,6 +235,14 @@ function boxBase:Update()
 
     local settings = self.Player and ESP.Player or ESP.Instance
     local color = self.Color or (self.ColorDynamic and self:ColorDynamic()) or ESP:GetColor(self.Object) or ESP.Color
+    
+    -- NEW: Update dynamic name if callback exists
+    if self.NameDynamic then
+        local newName = self:NameDynamic()
+        if newName then
+            self.Name = newName
+        end
+    end
     
     local allow = true
     if ESP.Overrides.UpdateAllow and not ESP.Overrides.UpdateAllow(self) then allow = false end
@@ -382,7 +393,21 @@ end
 
 function ESP:Add(obj, options)
     if self:GetBox(obj) then self:GetBox(obj):Remove() end
-    local box = setmetatable({ Name = options.Name or obj.Name, Type = "Box", Color = options.Color, Size = options.Size or ESP.BoxSize, Object = obj, Player = options.Player or Players:GetPlayerFromCharacter(obj), PrimaryPart = options.PrimaryPart or obj.ClassName == "Model" and (obj.PrimaryPart or obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildWhichIsA("BasePart")) or obj:IsA("BasePart") and obj, Components = {}, IsEnabled = options.IsEnabled, Temporary = options.Temporary, ColorDynamic = options.ColorDynamic, RenderInNil = options.RenderInNil }, boxBase)
+    local box = setmetatable({ 
+        Name = options.Name or obj.Name, 
+        Type = "Box", 
+        Color = options.Color, 
+        Size = options.Size or ESP.BoxSize, 
+        Object = obj, 
+        Player = options.Player or Players:GetPlayerFromCharacter(obj), 
+        PrimaryPart = options.PrimaryPart or obj.ClassName == "Model" and (obj.PrimaryPart or obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildWhichIsA("BasePart")) or obj:IsA("BasePart") and obj, 
+        Components = {}, 
+        IsEnabled = options.IsEnabled, 
+        Temporary = options.Temporary, 
+        ColorDynamic = options.ColorDynamic,
+        NameDynamic = options.NameDynamic, -- NEW: Store dynamic name callback
+        RenderInNil = options.RenderInNil 
+    }, boxBase)
     
     box.Components["Quad"] = Draw("Quad", { Thickness = ESP.Thickness, Transparency = 1, Filled = false })
     box.Components["Name"] = Draw("Text", { Center = true, Outline = true, Size = 19 })
