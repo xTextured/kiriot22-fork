@@ -19,7 +19,7 @@ A comprehensive ESP (Extra Sensory Perception) library for Roblox that provides 
 ## Installation
 
 ```lua
-local ESP = loadstring(game:HttpGet("path/to/esplib.lua"))()
+local ESP = loadstring(game:HttpGet("https://raw.githubusercontent.com/xTextured/kiriot22-fork/refs/heads/main/kiriot22.lua"))()
 ```
 
 Or if you have the file locally:
