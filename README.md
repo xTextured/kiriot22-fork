@@ -4,7 +4,7 @@
 
 A comprehensive ESP (Extra Sensory Perception) library for Roblox that provides visual overlays for players and objects. Features include 2D/3D boxes, health bars, distance indicators, tracers, highlights, and off-screen arrows.
 
-** THIS DOCUMENTATION WAS MADE BY AI (CLAUDE) **
+# THIS DOCUMENTATION WAS MADE BY AI (CLAUDE) 
 ## Table of Contents
 
 1. [Installation](#installation)
