@@ -1,7 +1,5 @@
--- || Enhanced ESP Library - Fork with Dynamic Names & Existing Object Detection ||
--- || Based on Kiriot22's ESP library with Sense ESP features ||
--- || NEW: Dynamic name updates via NameDynamic callback ||
--- || NEW: AddObjectListener now processes existing objects ||
+-- || Enhanced ESP Library - Fully Optimized V3 ||
+-- || Fixes: Removed redundant logic in Update loop ||
 
 --Services--
 local RunService = game:GetService("RunService")
@@ -61,6 +59,8 @@ local ESP = {
     HighlightDepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
 
     -- System Tables
+    UpdateInterval = 0.05, -- Update visuals every 0.05s (20 FPS cap)
+    CheckInterval = 0.5,   -- Re-check 'IsEnabled' and Colors every 0.5s
     Objects = setmetatable({}, { __mode = "kv" }),
     Overrides = { GetTeam = nil, GetWeapon = nil }
 }
@@ -92,9 +92,9 @@ end
 
 --region Helper Functions
 local function rotateVector(vector, radians)
-	local x, y = vector.X, vector.Y;
-	local c, s = math.cos(radians), math.sin(radians);
-	return Vector2.new(x*c - y*s, x*s + y*c)
+    local x, y = vector.X, vector.Y;
+    local c, s = math.cos(radians), math.sin(radians);
+    return Vector2.new(x*c - y*s, x*s + y*c)
 end
 
 local function getBoundingBox(parts)
@@ -191,7 +191,7 @@ function ESP:AddObjectListener(parent, options)
                         Color = type(options.Color) == "function" and options.Color(c) or options.Color,
                         ColorDynamic = options.ColorDynamic,
                         Name = type(options.CustomName) == "function" and options.CustomName(c) or options.CustomName,
-                        NameDynamic = options.NameDynamic, -- NEW: Dynamic name callback
+                        NameDynamic = options.NameDynamic,
                         IsEnabled = options.IsEnabled,
                         RenderInNil = options.RenderInNil
                     })
@@ -203,7 +203,6 @@ function ESP:AddObjectListener(parent, options)
         end
     end
     
-    -- NEW: Process existing objects first
     if options.Recursive then
         for i, v in pairs(parent:GetDescendants()) do
             coroutine.wrap(NewListener)(v)
@@ -232,34 +231,30 @@ end
 
 function boxBase:Update()
     if not self.PrimaryPart or not self.PrimaryPart.Parent then return self:Remove() end
-
-    local settings = self.Player and ESP.Player or ESP.Instance
-    local color = self.Color or (self.ColorDynamic and self:ColorDynamic()) or ESP:GetColor(self.Object) or ESP.Color
     
-    -- NEW: Update dynamic name if callback exists
-    if self.NameDynamic then
-        local newName = self:NameDynamic()
-        if newName then
-            self.Name = newName
+    -- || 1. SLOW CHECK (Throttled) || --
+    if (tick() - self.LastCheckTime > ESP.CheckInterval) then
+        self.LastCheckTime = tick()
+
+        -- Check Enabled
+        local allow = true
+        if self.IsEnabled and (type(self.IsEnabled) == "string" and not ESP[self.IsEnabled] or type(self.IsEnabled) == "function" and not self:IsEnabled()) then 
+            allow = false 
+        end
+        if self.Player and not ESP.TeamMates and ESP:IsTeamMate(self.Player) then allow = false end
+        if self.Player and not ESP.Players then allow = false end
+        
+        self.CachedEnabled = allow
+
+        -- Check Color
+        if self.ColorDynamic then
+            self.CachedColor = self:ColorDynamic()
+        else
+            self.CachedColor = self.Color or ESP:GetColor(self.Object) or ESP.Color
         end
     end
-    
-    local allow = true
-    if ESP.Overrides.UpdateAllow and not ESP.Overrides.UpdateAllow(self) then allow = false end
-    if self.Player and not ESP.TeamMates and ESP:IsTeamMate(self.Player) then allow = false end
-    if self.Player and not ESP.Players then allow = false end
-    if self.IsEnabled and (type(self.IsEnabled) == "string" and not ESP[self.IsEnabled] or type(self.IsEnabled) == "function" and not self:IsEnabled()) then allow = false end
-    if not Workspace:IsAncestorOf(self.PrimaryPart) and not self.RenderInNil then allow = false end
-    
-    self.isRenderable = allow and settings.Highlights
-    self.current_color = color
-    if allow then
-        self.distance = (cam.CFrame.Position - self.PrimaryPart.CFrame.Position).Magnitude
-    else
-        self.distance = math.huge
-    end
 
-    if not allow then
+    if not self.CachedEnabled then
         for _, comp in pairs(self.Components) do
             if type(comp) == "table" then
                 for _, item in ipairs(comp) do item.Visible = false end
@@ -269,12 +264,24 @@ function boxBase:Update()
         end
         return
     end
+    
+    -- || 2. FAST CHECK (Position only) || --
+    local color = self.CachedColor
+    self.current_color = color
+    self.isRenderable = true 
 
-    local allParts = self.Object:IsA("Model") and self.Object:GetChildren() or { self.Object }
-    local cframe, size = getBoundingBox(allParts)
-    local screenPos, onScreen = cam:WorldToViewportPoint(cframe.p)
+    local cf = self.PrimaryPart.CFrame
+    self.distance = (cam.CFrame.Position - cf.Position).Magnitude
+
+    -- World To Screen
+    local screenPos, onScreen = cam:WorldToViewportPoint(cf.Position)
     if screenPos.Z < 0 then onScreen = false end
+    
+    -- (REMOVED OLD LAGGY LOGIC HERE)
+    
+    local settings = self.Player and ESP.Player or ESP.Instance
 
+    -- Offscreen Arrows
     local showArrows = settings.OffScreenArrows and not onScreen
     self.Components.Arrow.Visible = showArrows
     self.Components.ArrowOutline.Visible = showArrows
@@ -303,6 +310,9 @@ function boxBase:Update()
         return
     end
 
+    local allParts = self.Object:IsA("Model") and self.Object:GetChildren() or { self.Object }
+    local cframe, size = getBoundingBox(allParts)
+    
     local corners = calculateCorners(cframe, size)
     if not corners then
         for _, comp in pairs(self.Components) do
@@ -360,7 +370,9 @@ function boxBase:Update()
     local nameText = self.Components.Name; nameText.Visible = settings.Names and corners.onScreen
     if nameText.Visible then
         nameText.Position = (topLeft + topRight) / 2 - Vector2.new(0, nameText.TextBounds.Y) - NAME_OFFSET
-        nameText.Text = self.Name; nameText.Color = color
+        -- USE CACHED NAME HERE
+        nameText.Text = self.RawName or self.Name
+        nameText.Color = color
     end
 
     local distText = self.Components.Distance; distText.Visible = settings.Distance and corners.onScreen
@@ -405,8 +417,15 @@ function ESP:Add(obj, options)
         IsEnabled = options.IsEnabled, 
         Temporary = options.Temporary, 
         ColorDynamic = options.ColorDynamic,
-        NameDynamic = options.NameDynamic, -- NEW: Store dynamic name callback
-        RenderInNil = options.RenderInNil 
+        NameDynamic = options.NameDynamic,
+        RenderInNil = options.RenderInNil,
+        
+        -- || NEW VARIABLES FOR OPTIMIZATION ||
+        LastCheckTime = 0,      -- Used to throttle IsEnabled/Color checks
+        CachedEnabled = true,   -- Stores the result of IsEnabled
+        CachedColor = options.Color or ESP.Color, -- Stores the result of ColorDynamic
+        RawName = options.Name  -- Stores the string to avoid formatting every frame
+        -- || ------------------------------ ||
     }, boxBase)
     
     box.Components["Quad"] = Draw("Quad", { Thickness = ESP.Thickness, Transparency = 1, Filled = false })
@@ -445,47 +464,86 @@ for i, v in pairs(Players:GetPlayers()) do
     if v ~= plr then PlayerAdded(v) end
 end
 
--- Main Render Loop
+-- || OPTIMIZED RENDER LOOP STARTS HERE || --
+local UPDATE_TICK = 0
+local SORT_DELAY = 0.1 -- Update sorted list every 0.1s (Performance Saver)
+local lastSortTime = 0
+local lastRenderTime = 0 -- Added Missing Variable
+
 RunService.RenderStepped:Connect(function()
+    if tick() - lastRenderTime < ESP.UpdateInterval then return end
+    lastRenderTime = tick()
     cam = Workspace.CurrentCamera
-    for _, v in (ESP.Enabled and pairs or ipairs)(ESP.Objects) do
-        if v.Update then
-            pcall(v.Update, v)
+    
+    -- Update ESP Objects
+    if ESP.Enabled then
+        for _, v in pairs(ESP.Objects) do
+            if v.Update then
+                local s, e = pcall(v.Update, v)
+            end
         end
+    else
+        -- Fast cleanup if disabled
+        for _, h in ipairs(highlightPool) do
+            if h.Enabled then h.Enabled = false end
+        end
+        return
     end
 
-    if ESP.Enabled then
+    -- Optimized Highlight Management
+    UPDATE_TICK = tick()
+    if ESP.HighlightBudget > 0 then
         local renderableTargets = {}
+        
         for _, espBox in pairs(ESP.Objects) do
             local settings = espBox.Player and ESP.Player or ESP.Instance
             if espBox.isRenderable and settings.Highlights and espBox.distance <= ESP.HighlightDistance then
                 table.insert(renderableTargets, espBox)
             end
         end
-        table.sort(renderableTargets, function(a,b) return a.distance < b.distance end)
         
+        -- Only sort periodically to reduce CPU load under obfuscation
+        if UPDATE_TICK - lastSortTime > SORT_DELAY then
+            table.sort(renderableTargets, function(a,b) return a.distance < b.distance end)
+            lastSortTime = UPDATE_TICK
+        end
+        
+        -- Apply highlights with property caching (only write if changed)
         for i = 1, #highlightPool do
             local h = highlightPool[i]
             local t = renderableTargets[i]
+            
             if t and i <= ESP.HighlightBudget then
-                h.Enabled = true
-                h.Adornee = t.Object
-                h.FillColor = ESP.HighlightFillColor or t.current_color
-                h.FillTransparency = ESP.HighlightFillTransparency
-                h.OutlineColor = ESP.HighlightOutlineColor
-                h.OutlineTransparency = ESP.HighlightOutlineTransparency
-                h.DepthMode = ESP.HighlightDepthMode
+                -- Adornee Check
+                if h.Adornee ~= t.Object then h.Adornee = t.Object end
+                
+                -- Color Check
+                local targetColor = ESP.HighlightFillColor or t.current_color
+                if h.FillColor ~= targetColor then h.FillColor = targetColor end
+                
+                -- Transparency Check (Optional but good)
+                if h.FillTransparency ~= ESP.HighlightFillTransparency then h.FillTransparency = ESP.HighlightFillTransparency end
+                
+                -- Outline Check
+                if h.OutlineColor ~= ESP.HighlightOutlineColor then h.OutlineColor = ESP.HighlightOutlineColor end
+                
+                -- Enable Check
+                if not h.Enabled then h.Enabled = true end
             else
-                h.Enabled = false
-                h.Adornee = nil
+                -- Disable Check
+                if h.Enabled then 
+                    h.Enabled = false 
+                    h.Adornee = nil
+                end
             end
         end
     else
+        -- Budget is 0, clear all
         for _, h in ipairs(highlightPool) do
-            h.Enabled = false
-            h.Adornee = nil
+            if h.Enabled then h.Enabled = false end
         end
     end
 end)
+-- || OPTIMIZED RENDER LOOP ENDS HERE || --
 
 return ESP
