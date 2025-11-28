@@ -255,6 +255,7 @@ function boxBase:Update()
     end
 
     if not self.CachedEnabled then
+        self.isRenderable = false 
         for _, comp in pairs(self.Components) do
             if type(comp) == "table" then
                 for _, item in ipairs(comp) do item.Visible = false end
