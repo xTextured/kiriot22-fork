@@ -1,5 +1,5 @@
--- || Enhanced ESP Library - Fully Optimized V3 ||
--- || Fixes: Removed redundant logic in Update loop ||
+-- || Enhanced ESP Library - Fully Optimized V3 with Pivot Support ||
+-- || NEW: Support for Models with only WorldPivot (no parts) ||
 
 --Services--
 local RunService = game:GetService("RunService")
@@ -57,10 +57,14 @@ local ESP = {
     HighlightFillTransparency = 0.5,
     HighlightOutlineTransparency = 0,
     HighlightDepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+    
+    -- NEW: Pivot/Virtual Part Settings
+    PivotBoxSize = Vector3.new(4, 4, 4), -- Default size for pivot-only objects
+    CreateVirtualParts = false, -- If true, creates invisible parts for pivot-only objects
 
     -- System Tables
-    UpdateInterval = 0.05, -- Update visuals every 0.05s (20 FPS cap)
-    CheckInterval = 0.5,   -- Re-check 'IsEnabled' and Colors every 0.5s
+    UpdateInterval = 0.05,
+    CheckInterval = 0.5,
     Objects = setmetatable({}, { __mode = "kv" }),
     Overrides = { GetTeam = nil, GetWeapon = nil }
 }
@@ -113,6 +117,30 @@ local function getBoundingBox(parts)
     if not min or not max then return end
     local center = (min + max) * 0.5
     return CFrame.new(center), max - min
+end
+
+-- NEW: Get CFrame and Size for any object (including pivot-only)
+local function getObjectCFrameAndSize(obj, customSize)
+    if obj:IsA("BasePart") then
+        return obj.CFrame, obj.Size
+    elseif obj:IsA("Model") then
+        local parts = {}
+        for _, v in ipairs(obj:GetDescendants()) do
+            if v:IsA("BasePart") then
+                table.insert(parts, v)
+            end
+        end
+        
+        if #parts > 0 then
+            return getBoundingBox(parts)
+        else
+            -- No parts found, use WorldPivot
+            local pivot = obj:GetPivot()
+            local size = customSize or ESP.PivotBoxSize
+            return pivot, size
+        end
+    end
+    return nil, nil
 end
 
 local VERTICES = { Vector3.new(-1,-1,-1), Vector3.new(1,-1,-1), Vector3.new(1,1,-1), Vector3.new(-1,1,-1), Vector3.new(-1,-1,1), Vector3.new(1,-1,1), Vector3.new(1,1,1), Vector3.new(-1,1,1) }
@@ -193,7 +221,9 @@ function ESP:AddObjectListener(parent, options)
                         Name = type(options.CustomName) == "function" and options.CustomName(c) or options.CustomName,
                         NameDynamic = options.NameDynamic,
                         IsEnabled = options.IsEnabled,
-                        RenderInNil = options.RenderInNil
+                        RenderInNil = options.RenderInNil,
+                        Size = options.Size,
+                        UsePivot = options.UsePivot
                     })
                     if options.OnAdded then
                         coroutine.wrap(options.OnAdded)(box)
@@ -226,11 +256,19 @@ function boxBase:Remove()
             v:Remove()
         end
     end
+    
+    -- NEW: Clean up virtual part if it exists
+    if self.VirtualPart then
+        self.VirtualPart:Destroy()
+        self.VirtualPart = nil
+    end
+    
     table.clear(self.Components)
 end
 
 function boxBase:Update()
-    if not self.PrimaryPart or not self.PrimaryPart.Parent then return self:Remove() end
+    -- NEW: Check if object still exists (works for pivot-only models)
+    if not self.Object or not self.Object.Parent then return self:Remove() end
     
     -- || 1. SLOW CHECK (Throttled) || --
     if (tick() - self.LastCheckTime > ESP.CheckInterval) then
@@ -271,14 +309,25 @@ function boxBase:Update()
     self.current_color = color
     self.isRenderable = true 
 
-    local cf = self.PrimaryPart.CFrame
+    -- NEW: Get CFrame using pivot or parts
+    local cf, size = getObjectCFrameAndSize(self.Object, self.Size)
+    if not cf then
+        self.isRenderable = false
+        for _, comp in pairs(self.Components) do
+            if type(comp) == "table" then
+                for _, item in ipairs(comp) do item.Visible = false end
+            else
+                comp.Visible = false
+            end
+        end
+        return
+    end
+
     self.distance = (cam.CFrame.Position - cf.Position).Magnitude
 
     -- World To Screen
     local screenPos, onScreen = cam:WorldToViewportPoint(cf.Position)
     if screenPos.Z < 0 then onScreen = false end
-    
-    -- (REMOVED OLD LAGGY LOGIC HERE)
     
     local settings = self.Player and ESP.Player or ESP.Instance
 
@@ -311,10 +360,7 @@ function boxBase:Update()
         return
     end
 
-    local allParts = self.Object:IsA("Model") and self.Object:GetChildren() or { self.Object }
-    local cframe, size = getBoundingBox(allParts)
-    
-    local corners = calculateCorners(cframe, size)
+    local corners = calculateCorners(cf, size)
     if not corners then
         for _, comp in pairs(self.Components) do
             if type(comp) == "table" then
@@ -371,7 +417,6 @@ function boxBase:Update()
     local nameText = self.Components.Name; nameText.Visible = settings.Names and corners.onScreen
     if nameText.Visible then
         nameText.Position = (topLeft + topRight) / 2 - Vector2.new(0, nameText.TextBounds.Y) - NAME_OFFSET
-        -- USE CACHED NAME HERE
         nameText.Text = self.RawName or self.Name
         nameText.Color = color
     end
@@ -379,7 +424,7 @@ function boxBase:Update()
     local distText = self.Components.Distance; distText.Visible = settings.Distance and corners.onScreen
     if distText.Visible then
         distText.Position = (bottomLeft + bottomRight) / 2 + DISTANCE_OFFSET
-        distText.Text = math.floor((cam.CFrame.p - cframe.p).magnitude) .. "m"
+        distText.Text = math.floor((cam.CFrame.p - cf.p).magnitude) .. "m"
         distText.Color = color
     end
 
@@ -393,7 +438,7 @@ function boxBase:Update()
     end
 
     if settings.Tracers then
-        local TorsoPos, Vis6 = cam:WorldToViewportPoint(cframe.p)
+        local TorsoPos, Vis6 = cam:WorldToViewportPoint(cf.p)
         if Vis6 then
             self.Components.Tracer.Visible = true; self.Components.Tracer.From = Vector2.new(TorsoPos.X, TorsoPos.Y); self.Components.Tracer.To = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / ESP.AttachShift); self.Components.Tracer.Color = color
         else
@@ -406,14 +451,56 @@ end
 
 function ESP:Add(obj, options)
     if self:GetBox(obj) then self:GetBox(obj):Remove() end
+    
+    options = options or {}
+    local customSize = options.Size or self.BoxSize
+    
+    -- NEW: Determine PrimaryPart or create virtual part
+    local primaryPart = options.PrimaryPart
+    local virtualPart = nil
+    
+    if not primaryPart and options.UsePivot then
+        if obj:IsA("Model") then
+            -- Check if model has any parts
+            local hasParts = false
+            for _, v in ipairs(obj:GetDescendants()) do
+                if v:IsA("BasePart") then
+                    hasParts = true
+                    break
+                end
+            end
+            
+            if not hasParts and ESP.CreateVirtualParts then
+                -- Create invisible part at pivot position
+                virtualPart = Instance.new("Part")
+                virtualPart.Size = customSize
+                virtualPart.CFrame = obj:GetPivot()
+                virtualPart.Anchored = true
+                virtualPart.CanCollide = false
+                virtualPart.Transparency = 1
+                virtualPart.Parent = obj
+                primaryPart = virtualPart
+            end
+        end
+    end
+    
+    if not primaryPart and not options.UsePivot then
+        if obj.ClassName == "Model" then
+            primaryPart = obj.PrimaryPart or obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildWhichIsA("BasePart")
+        elseif obj:IsA("BasePart") then
+            primaryPart = obj
+        end
+    end
+    
     local box = setmetatable({ 
         Name = options.Name or obj.Name, 
         Type = "Box", 
         Color = options.Color, 
-        Size = options.Size or ESP.BoxSize, 
+        Size = customSize,
         Object = obj, 
         Player = options.Player or Players:GetPlayerFromCharacter(obj), 
-        PrimaryPart = options.PrimaryPart or obj.ClassName == "Model" and (obj.PrimaryPart or obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildWhichIsA("BasePart")) or obj:IsA("BasePart") and obj, 
+        PrimaryPart = primaryPart,
+        VirtualPart = virtualPart, -- NEW: Store reference to virtual part
         Components = {}, 
         IsEnabled = options.IsEnabled, 
         Temporary = options.Temporary, 
@@ -421,12 +508,10 @@ function ESP:Add(obj, options)
         NameDynamic = options.NameDynamic,
         RenderInNil = options.RenderInNil,
         
-        -- || NEW VARIABLES FOR OPTIMIZATION ||
-        LastCheckTime = 0,      -- Used to throttle IsEnabled/Color checks
-        CachedEnabled = true,   -- Stores the result of IsEnabled
-        CachedColor = options.Color or ESP.Color, -- Stores the result of ColorDynamic
-        RawName = options.Name  -- Stores the string to avoid formatting every frame
-        -- || ------------------------------ ||
+        LastCheckTime = 0,
+        CachedEnabled = true,
+        CachedColor = options.Color or ESP.Color,
+        RawName = options.Name
     }, boxBase)
     
     box.Components["Quad"] = Draw("Quad", { Thickness = ESP.Thickness, Transparency = 1, Filled = false })
@@ -467,16 +552,15 @@ end
 
 -- || OPTIMIZED RENDER LOOP STARTS HERE || --
 local UPDATE_TICK = 0
-local SORT_DELAY = 0.1 -- Update sorted list every 0.1s (Performance Saver)
+local SORT_DELAY = 0.1
 local lastSortTime = 0
-local lastRenderTime = 0 -- Added Missing Variable
+local lastRenderTime = 0
 
 RunService.RenderStepped:Connect(function()
     if tick() - lastRenderTime < ESP.UpdateInterval then return end
     lastRenderTime = tick()
     cam = Workspace.CurrentCamera
     
-    -- Update ESP Objects
     if ESP.Enabled then
         for _, v in pairs(ESP.Objects) do
             if v.Update then
@@ -484,14 +568,12 @@ RunService.RenderStepped:Connect(function()
             end
         end
     else
-        -- Fast cleanup if disabled
         for _, h in ipairs(highlightPool) do
             if h.Enabled then h.Enabled = false end
         end
         return
     end
 
-    -- Optimized Highlight Management
     UPDATE_TICK = tick()
     if ESP.HighlightBudget > 0 then
         local renderableTargets = {}
@@ -503,35 +585,23 @@ RunService.RenderStepped:Connect(function()
             end
         end
         
-        -- Only sort periodically to reduce CPU load under obfuscation
         if UPDATE_TICK - lastSortTime > SORT_DELAY then
             table.sort(renderableTargets, function(a,b) return a.distance < b.distance end)
             lastSortTime = UPDATE_TICK
         end
         
-        -- Apply highlights with property caching (only write if changed)
         for i = 1, #highlightPool do
             local h = highlightPool[i]
             local t = renderableTargets[i]
             
             if t and i <= ESP.HighlightBudget then
-                -- Adornee Check
                 if h.Adornee ~= t.Object then h.Adornee = t.Object end
-                
-                -- Color Check
                 local targetColor = ESP.HighlightFillColor or t.current_color
                 if h.FillColor ~= targetColor then h.FillColor = targetColor end
-                
-                -- Transparency Check (Optional but good)
                 if h.FillTransparency ~= ESP.HighlightFillTransparency then h.FillTransparency = ESP.HighlightFillTransparency end
-                
-                -- Outline Check
                 if h.OutlineColor ~= ESP.HighlightOutlineColor then h.OutlineColor = ESP.HighlightOutlineColor end
-                
-                -- Enable Check
                 if not h.Enabled then h.Enabled = true end
             else
-                -- Disable Check
                 if h.Enabled then 
                     h.Enabled = false 
                     h.Adornee = nil
@@ -539,7 +609,6 @@ RunService.RenderStepped:Connect(function()
             end
         end
     else
-        -- Budget is 0, clear all
         for _, h in ipairs(highlightPool) do
             if h.Enabled then h.Enabled = false end
         end
