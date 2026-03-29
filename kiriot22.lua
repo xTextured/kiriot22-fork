@@ -214,7 +214,15 @@ function ESP:Toggle(bool)
                 if v.Temporary then
                     v:Remove()
                 else
-                    for i, v in pairs(v.Components) do v.Visible = false end
+                    for _, comp in pairs(v.Components) do
+                        if type(comp) == "table" then
+                            for _, item in pairs(comp) do
+                                if type(item) == "userdata" then item.Visible = false end
+                            end
+                        else
+                            comp.Visible = false
+                        end
+                    end
                 end
             end
         end
@@ -267,7 +275,9 @@ function boxBase:Remove()
     ESP.Objects[self.Object] = nil
     for i, v in pairs(self.Components) do
         if type(v) == "table" then
-            for _, line in ipairs(v) do line:Remove() end
+            for _, line in pairs(v) do  -- pairs handles both arrays and dicts
+                if type(line) == "userdata" then line:Remove() end
+            end
         else
             v:Remove()
         end
@@ -312,7 +322,9 @@ function boxBase:Update()
         self.isRenderable = false 
         for _, comp in pairs(self.Components) do
             if type(comp) == "table" then
-                for _, item in ipairs(comp) do item.Visible = false end
+                for _, item in pairs(comp) do  -- pairs instead of ipairs
+                    if type(item) == "userdata" then item.Visible = false end
+                end
             else
                 comp.Visible = false
             end
@@ -331,7 +343,9 @@ function boxBase:Update()
         self.isRenderable = false
         for _, comp in pairs(self.Components) do
             if type(comp) == "table" then
-                for _, item in ipairs(comp) do item.Visible = false end
+                for _, item in pairs(comp) do  -- pairs instead of ipairs
+                    if type(item) == "userdata" then item.Visible = false end
+                end
             else
                 comp.Visible = false
             end
@@ -380,7 +394,9 @@ function boxBase:Update()
     if not corners then
         for _, comp in pairs(self.Components) do
             if type(comp) == "table" then
-                for _, item in ipairs(comp) do item.Visible = false end
+                for _, item in pairs(comp) do  -- pairs instead of ipairs
+                    if type(item) == "userdata" then item.Visible = false end
+                end
             else
                 comp.Visible = false
             end
