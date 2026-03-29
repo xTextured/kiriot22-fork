@@ -168,19 +168,27 @@ end
 --endregion
 
 function ESP:AddCustomText(id, options)
-    -- Remove existing entry with same id if any
     for i, t in ipairs(self.CustomTexts) do
         if t.id == id then table.remove(self.CustomTexts, i) break end
     end
-    table.insert(self.CustomTexts, {
+    local def = {
         id = id,
         enabled = options.enabled ~= false,
         size = options.size or 19,
-        getValue = options.getValue,   -- fn(player, object) -> string or nil
-        getColor = options.getColor,   -- fn(player, object) -> Color3 or nil (optional)
-    })
-end
+        getValue = options.getValue,
+        getColor = options.getColor,
+    }
+    table.insert(self.CustomTexts, def)
 
+    -- Patch all existing boxes that don't have this component yet
+    for _, box in pairs(self.Objects) do
+        if box.Components and box.Components.CustomTexts then
+            if not box.Components.CustomTexts[id] then
+                box.Components.CustomTexts[id] = Draw("Text", { Center = true, Outline = true, Size = def.size or 19 })
+            end
+        end
+    end
+end
 
 function ESP:GetTeam(p)
     if self.Overrides.GetTeam then return self.Overrides.GetTeam(p) end
