@@ -121,7 +121,12 @@ local function getBoundingBox(parts)
 end
 
 -- NEW: Get CFrame and Size for any object (including pivot-only)
-local function getObjectCFrameAndSize(obj, customSize)
+local function getObjectCFrameAndSize(obj, customSize, primaryPart)
+    -- If a primary part is specified, use it directly with the custom size
+    if primaryPart and primaryPart.Parent then
+        return primaryPart.CFrame, customSize
+    end
+
     if obj:IsA("BasePart") then
         return obj.CFrame, obj.Size
     elseif obj:IsA("Model") then
@@ -131,11 +136,9 @@ local function getObjectCFrameAndSize(obj, customSize)
                 table.insert(parts, v)
             end
         end
-        
         if #parts > 0 then
             return getBoundingBox(parts)
         else
-            -- No parts found, use WorldPivot
             local pivot = obj:GetPivot()
             local size = customSize or ESP.PivotBoxSize
             return pivot, size
@@ -346,7 +349,8 @@ function boxBase:Update()
     self.isRenderable = true 
 
     -- NEW: Get CFrame using pivot or parts
-    local cf, size = getObjectCFrameAndSize(self.Object, self.Size)
+    local cf, size = getObjectCFrameAndSize(self.Object, self.Size, self.PrimaryPart)
+
     if not cf then
         self.isRenderable = false
         for _, comp in pairs(self.Components) do
