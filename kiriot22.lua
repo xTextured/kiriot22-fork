@@ -592,10 +592,12 @@ end
 
 local function CharAdded(char)
     local p = Players:GetPlayerFromCharacter(char)
+    if not p then return end  -- ADD THIS
     local hrp = char:WaitForChild("HumanoidRootPart", 5)
     if not hrp then return end
     ESP:Add(char, { Name = p.Name, Player = p, PrimaryPart = hrp })
 end
+
 local function PlayerAdded(p)
     p.CharacterAdded:Connect(CharAdded)
     if p.Character then
