@@ -19,6 +19,7 @@ local ESP = {
     TeamMates = true,
     Players = true,
     Color = Color3.fromRGB(255, 170, 0),
+    CustomTexts = {}, -- { id = "role", getValue = fn, enabled = true, size = 19, yOffset = 0 }
 
     -- Per-Type Settings
     Player = {
@@ -166,6 +167,21 @@ local function calculateCorners(cframe, size)
 end
 --endregion
 
+function ESP:AddCustomText(id, options)
+    -- Remove existing entry with same id if any
+    for i, t in ipairs(self.CustomTexts) do
+        if t.id == id then table.remove(self.CustomTexts, i) break end
+    end
+    table.insert(self.CustomTexts, {
+        id = id,
+        enabled = options.enabled ~= false,
+        size = options.size or 19,
+        getValue = options.getValue,   -- fn(player, object) -> string or nil
+        getColor = options.getColor,   -- fn(player, object) -> Color3 or nil (optional)
+    })
+end
+
+
 function ESP:GetTeam(p)
     if self.Overrides.GetTeam then return self.Overrides.GetTeam(p) end
     return p and p.Team
@@ -269,7 +285,7 @@ end
 function boxBase:Update()
     -- NEW: Check if object still exists (works for pivot-only models)
     if not self.Object or not self.Object.Parent then return self:Remove() end
-    
+    local stackedY = 0
     -- || 1. SLOW CHECK (Throttled) || --
     if (tick() - self.LastCheckTime > ESP.CheckInterval) then
         self.LastCheckTime = tick()
@@ -421,21 +437,40 @@ function boxBase:Update()
         nameText.Color = color
     end
 
-    local distText = self.Components.Distance; distText.Visible = settings.Distance and corners.onScreen
+    local distText = self.Components.Distance
+    distText.Visible = settings.Distance and corners.onScreen
     if distText.Visible then
         distText.Position = (bottomLeft + bottomRight) / 2 + DISTANCE_OFFSET
         distText.Text = math.floor((cam.CFrame.p - cf.p).magnitude) .. "m"
         distText.Color = color
+        stackedY = stackedY + distText.TextBounds.Y + 2
     end
-
+    
     local weaponText = self.Components.Weapon
     local weaponName = self.Player and ESP.Overrides.GetWeapon and ESP.Overrides.GetWeapon(self.Player)
     weaponText.Visible = not not (settings.Weapon and weaponName and corners.onScreen)
     if weaponText.Visible then
-        local yOffset = settings.Distance and distText.TextBounds.Y or 0
-        weaponText.Position = (bottomLeft + bottomRight) / 2 + DISTANCE_OFFSET + Vector2.new(0, yOffset) + WEAPON_OFFSET
-        weaponText.Text = weaponName; weaponText.Color = color
+        weaponText.Position = (bottomLeft + bottomRight) / 2 + DISTANCE_OFFSET + Vector2.new(0, stackedY)
+        weaponText.Text = weaponName
+        weaponText.Color = color
+        stackedY = stackedY + weaponText.TextBounds.Y + 2
     end
+
+    for _, textDef in ipairs(ESP.CustomTexts) do
+        local comp = self.Components.CustomTexts and self.Components.CustomTexts[textDef.id]
+        if not comp then continue end
+    
+        local value = textDef.enabled and corners.onScreen and textDef.getValue and textDef.getValue(self.Player, self.Object)
+        comp.Visible = not not value
+        if comp.Visible then
+            comp.Text = tostring(value)
+            comp.Color = textDef.getColor and textDef.getColor(self.Player, self.Object) or color
+            comp.Size = textDef.size or 19
+            comp.Position = (bottomLeft + bottomRight) / 2 + DISTANCE_OFFSET + Vector2.new(0, stackedY)
+            stackedY = stackedY + comp.TextBounds.Y + 2
+        end
+    end
+    
 
     if settings.Tracers then
         local TorsoPos, Vis6 = cam:WorldToViewportPoint(cf.p)
@@ -513,10 +548,16 @@ function ESP:Add(obj, options)
         CachedColor = options.Color or ESP.Color,
         RawName = options.Name
     }, boxBase)
-    
+
     box.Components["Quad"] = Draw("Quad", { Thickness = ESP.Thickness, Transparency = 1, Filled = false })
     box.Components["Name"] = Draw("Text", { Center = true, Outline = true, Size = 19 })
     box.Components["Distance"] = Draw("Text", { Center = true, Outline = true, Size = 19 })
+    
+    box.Components["CustomTexts"] = {}
+    for _, textDef in ipairs(ESP.CustomTexts) do
+        box.Components.CustomTexts[textDef.id] = Draw("Text", { Center = true, Outline = true, Size = textDef.size or 19 })
+    end
+    
     box.Components["Tracer"] = Draw("Line", { Thickness = ESP.Thickness, Transparency = 1 })
     box.Components["Weapon"] = Draw("Text", {Center = true, Outline = true, Size = 19})
     box.Components["HealthBarOutline"] = Draw("Line", { Thickness = 5, Color = Color3.new(0,0,0), ZIndex = 1 })
