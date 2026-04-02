@@ -1,5 +1,6 @@
 -- || Enhanced ESP Library - Fully Optimized V3 with Pivot Support ||
--- || NEW: Support for Models with only WorldPivot (no parts) ||
+-- || Fixes: getBoundingBox stability, UseBoundingBox flag, CustomTexts dict iteration,
+--           AddCustomText retroactive patching, CharAdded nil guard ||
 
 --Services--
 local RunService = game:GetService("RunService")
@@ -19,7 +20,7 @@ local ESP = {
     TeamMates = true,
     Players = true,
     Color = Color3.fromRGB(255, 170, 0),
-    CustomTexts = {}, -- { id = "role", getValue = fn, enabled = true, size = 19, yOffset = 0 }
+    CustomTexts = {}, -- { id = "role", getValue = fn, enabled = true, size = 19 }
 
     -- Per-Type Settings
     Player = {
@@ -58,10 +59,10 @@ local ESP = {
     HighlightFillTransparency = 0.5,
     HighlightOutlineTransparency = 0,
     HighlightDepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
-    
-    -- NEW: Pivot/Virtual Part Settings
-    PivotBoxSize = Vector3.new(4, 4, 4), -- Default size for pivot-only objects
-    CreateVirtualParts = false, -- If true, creates invisible parts for pivot-only objects
+
+    -- Pivot/Virtual Part Settings
+    PivotBoxSize = Vector3.new(4, 4, 4),
+    CreateVirtualParts = false,
 
     -- System Tables
     UpdateInterval = 0.05,
@@ -95,66 +96,99 @@ local function Draw(obj, props)
     return new
 end
 
+-- Helper: hide all components in a box, handling both array and dict sub-tables
+local function hideAllComponents(components)
+    for _, comp in pairs(components) do
+        if type(comp) == "table" then
+            for _, item in pairs(comp) do
+                if type(item) == "userdata" then item.Visible = false end
+            end
+        else
+            comp.Visible = false
+        end
+    end
+end
+
 --region Helper Functions
 local function rotateVector(vector, radians)
-    local x, y = vector.X, vector.Y;
-    local c, s = math.cos(radians), math.sin(radians);
+    local x, y = vector.X, vector.Y
+    local c, s = math.cos(radians), math.sin(radians)
     return Vector2.new(x*c - y*s, x*s + y*c)
 end
 
+local VERTICES = {
+    Vector3.new(-1,-1,-1), Vector3.new(1,-1,-1), Vector3.new(1,1,-1), Vector3.new(-1,1,-1),
+    Vector3.new(-1,-1,1),  Vector3.new(1,-1,1),  Vector3.new(1,1,1),  Vector3.new(-1,1,1)
+}
+local CUBE_EDGES = { 1,2, 2,3, 3,4, 4,1, 5,6, 6,7, 7,8, 8,5, 1,5, 2,6, 3,7, 4,8 }
+
+-- FIX: Properly samples all 8 corners of each part accounting for rotation,
+-- producing a stable world-space AABB. The old version only used center ± halfSize
+-- in world space without rotation, so rotating parts caused the center to drift/jitter.
 local function getBoundingBox(parts)
-    local min, max
-    for i = 1, #parts do
-        local part = parts[i]
+    local minX, minY, minZ =  math.huge,  math.huge,  math.huge
+    local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+
+    for _, part in ipairs(parts) do
         if part:IsA("BasePart") then
-            local cframe, size = part.CFrame, part.Size
-            local pos = cframe.Position
-            min = min and pos:Min(min) or pos
-            max = max and pos:Max(max) or pos
-            min = min and (cframe - size / 2).Position:Min(min) or (cframe - size / 2).Position
-            max = max and (cframe + size / 2).Position:Max(max) or (cframe + size / 2).Position
+            local cf   = part.CFrame
+            local half = part.Size * 0.5
+            for _, v in ipairs(VERTICES) do
+                local wp = (cf * CFrame.new(half * v)).Position
+                if wp.X < minX then minX = wp.X end
+                if wp.Y < minY then minY = wp.Y end
+                if wp.Z < minZ then minZ = wp.Z end
+                if wp.X > maxX then maxX = wp.X end
+                if wp.Y > maxY then maxY = wp.Y end
+                if wp.Z > maxZ then maxZ = wp.Z end
+            end
         end
     end
-    if not min or not max then return end
-    local center = (min + max) * 0.5
-    return CFrame.new(center), max - min
+
+    if minX == math.huge then return nil, nil end
+    local center = Vector3.new((minX+maxX)*0.5, (minY+maxY)*0.5, (minZ+maxZ)*0.5)
+    local size   = Vector3.new(maxX-minX, maxY-minY, maxZ-minZ)
+    return CFrame.new(center), size
 end
 
--- NEW: Get CFrame and Size for any object (including pivot-only)
-local function getObjectCFrameAndSize(obj, customSize, primaryPart)
-    -- If a primary part is specified, use it directly with the custom size
-    if primaryPart and primaryPart.Parent then
+-- FIX: Added primaryPart and useBoundingBox params.
+-- primaryPart fast-path skips expensive descendant iteration for player characters.
+-- useBoundingBox forces full AABB even when primaryPart is set (for instance ESP).
+local function getObjectCFrameAndSize(obj, customSize, primaryPart, useBoundingBox, cachedParts)
+    if primaryPart and primaryPart.Parent and not useBoundingBox then
         return primaryPart.CFrame, customSize
     end
 
     if obj:IsA("BasePart") then
         return obj.CFrame, obj.Size
     elseif obj:IsA("Model") then
-        local parts = {}
-        for _, v in ipairs(obj:GetDescendants()) do
-            if v:IsA("BasePart") then
-                table.insert(parts, v)
+        -- Use cached parts list if provided (avoids GetDescendants every frame)
+        local parts = cachedParts
+        if not parts then
+            parts = {}
+            for _, v in ipairs(obj:GetDescendants()) do
+                if v:IsA("BasePart") then
+                    table.insert(parts, v)
+                end
             end
         end
+
         if #parts > 0 then
             return getBoundingBox(parts)
         else
             local pivot = obj:GetPivot()
-            local size = customSize or ESP.PivotBoxSize
+            local size  = customSize or ESP.PivotBoxSize
             return pivot, size
         end
     end
     return nil, nil
 end
 
-local VERTICES = { Vector3.new(-1,-1,-1), Vector3.new(1,-1,-1), Vector3.new(1,1,-1), Vector3.new(-1,1,-1), Vector3.new(-1,-1,1), Vector3.new(1,-1,1), Vector3.new(1,1,1), Vector3.new(-1,1,1) }
-local CUBE_EDGES = { 1,2, 2,3, 3,4, 4,1, 5,6, 6,7, 7,8, 8,5, 1,5, 2,6, 3,7, 4,8 }
-
 local function calculateCorners(cframe, size)
     if not cframe or not size then return nil end
     local worldVertices, screenVertices = {}, {}
     for i = 1, #VERTICES do
-        worldVertices[i] = (cframe * CFrame.new(size * VERTICES[i] / 2)).Position
+        worldVertices[i] = (cframe * CFrame.new(size * VERTICES[i] * 0.5)).Position
     end
     local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
     local allOnScreen = true
@@ -163,27 +197,36 @@ local function calculateCorners(cframe, size)
         if not onScreen then allOnScreen = false end
         local posVec2 = Vector2.new(screenPos.X, screenPos.Y)
         screenVertices[i] = posVec2
-        minX = math.min(minX, posVec2.X); minY = math.min(minY, posVec2.Y)
-        maxX = math.max(maxX, posVec2.X); maxY = math.max(maxY, posVec2.Y)
+        if posVec2.X < minX then minX = posVec2.X end
+        if posVec2.Y < minY then minY = posVec2.Y end
+        if posVec2.X > maxX then maxX = posVec2.X end
+        if posVec2.Y > maxY then maxY = posVec2.Y end
     end
-    return { onScreen = allOnScreen, vertices = screenVertices, topLeft = Vector2.new(minX, minY), bottomRight = Vector2.new(maxX, maxY) }
+    return {
+        onScreen    = allOnScreen,
+        vertices    = screenVertices,
+        topLeft     = Vector2.new(minX, minY),
+        bottomRight = Vector2.new(maxX, maxY)
+    }
 end
 --endregion
 
+-- FIX: Now also retroactively creates the drawing component on all already-tracked
+-- boxes so call order (before or after ESP:Add) doesn't matter.
 function ESP:AddCustomText(id, options)
     for i, t in ipairs(self.CustomTexts) do
         if t.id == id then table.remove(self.CustomTexts, i) break end
     end
     local def = {
-        id = id,
-        enabled = options.enabled ~= false,
-        size = options.size or 19,
+        id       = id,
+        enabled  = options.enabled ~= false,
+        size     = options.size or 19,
         getValue = options.getValue,
         getColor = options.getColor,
     }
     table.insert(self.CustomTexts, def)
 
-    -- Patch all existing boxes that don't have this component yet
+    -- Patch existing boxes that were added before this custom text was registered
     for _, box in pairs(self.Objects) do
         if box.Components and box.Components.CustomTexts then
             if not box.Components.CustomTexts[id] then
@@ -220,20 +263,12 @@ end
 function ESP:Toggle(bool)
     self.Enabled = bool
     if not bool then
-        for i, v in pairs(self.Objects) do
+        for _, v in pairs(self.Objects) do
             if v.Type == "Box" then
                 if v.Temporary then
                     v:Remove()
                 else
-                    for _, comp in pairs(v.Components) do
-                        if type(comp) == "table" then
-                            for _, item in pairs(comp) do
-                                if type(item) == "userdata" then item.Visible = false end
-                            end
-                        else
-                            comp.Visible = false
-                        end
-                    end
+                    hideAllComponents(v.Components)
                 end
             end
         end
@@ -250,15 +285,17 @@ function ESP:AddObjectListener(parent, options)
             if (type(options.Name) == "string" and c.Name == options.Name or options.Name == nil) then
                 if (not options.Validator or options.Validator(c)) then
                     local box = ESP:Add(c, {
-                        PrimaryPart = type(options.PrimaryPart) == "string" and c:WaitForChild(options.PrimaryPart) or type(options.PrimaryPart) == "function" and options.PrimaryPart(c),
-                        Color = type(options.Color) == "function" and options.Color(c) or options.Color,
-                        ColorDynamic = options.ColorDynamic,
-                        Name = type(options.CustomName) == "function" and options.CustomName(c) or options.CustomName,
-                        NameDynamic = options.NameDynamic,
-                        IsEnabled = options.IsEnabled,
-                        RenderInNil = options.RenderInNil,
-                        Size = options.Size,
-                        UsePivot = options.UsePivot
+                        PrimaryPart    = type(options.PrimaryPart) == "string" and c:WaitForChild(options.PrimaryPart)
+                                      or type(options.PrimaryPart) == "function" and options.PrimaryPart(c),
+                        Color          = type(options.Color) == "function" and options.Color(c) or options.Color,
+                        ColorDynamic   = options.ColorDynamic,
+                        Name           = type(options.CustomName) == "function" and options.CustomName(c) or options.CustomName,
+                        NameDynamic    = options.NameDynamic,
+                        IsEnabled      = options.IsEnabled,
+                        RenderInNil    = options.RenderInNil,
+                        Size           = options.Size,
+                        UsePivot       = options.UsePivot,
+                        UseBoundingBox = options.UseBoundingBox, -- NEW
                     })
                     if options.OnAdded then
                         coroutine.wrap(options.OnAdded)(box)
@@ -267,14 +304,14 @@ function ESP:AddObjectListener(parent, options)
             end
         end
     end
-    
+
     if options.Recursive then
-        for i, v in pairs(parent:GetDescendants()) do
+        for _, v in pairs(parent:GetDescendants()) do
             coroutine.wrap(NewListener)(v)
         end
         parent.DescendantAdded:Connect(NewListener)
     else
-        for i, v in pairs(parent:GetChildren()) do
+        for _, v in pairs(parent:GetChildren()) do
             coroutine.wrap(NewListener)(v)
         end
         parent.ChildAdded:Connect(NewListener)
@@ -282,46 +319,93 @@ function ESP:AddObjectListener(parent, options)
 end
 
 local boxBase = {}; boxBase.__index = boxBase
+
 function boxBase:Remove()
     ESP.Objects[self.Object] = nil
-    for i, v in pairs(self.Components) do
+
+    -- FIX: Use pairs so the CustomTexts dict sub-table is fully iterated
+    for _, v in pairs(self.Components) do
         if type(v) == "table" then
-            for _, line in pairs(v) do  -- pairs handles both arrays and dicts
+            for _, line in pairs(v) do
                 if type(line) == "userdata" then line:Remove() end
             end
         else
             v:Remove()
         end
     end
-    
-    -- NEW: Clean up virtual part if it exists
+
     if self.VirtualPart then
         self.VirtualPart:Destroy()
         self.VirtualPart = nil
     end
-    
+
+    -- Clean up parts cache connections
+    if self._partsConnections then
+        for _, conn in ipairs(self._partsConnections) do
+            conn:Disconnect()
+        end
+        self._partsConnections = nil
+        self._cachedParts = nil
+    end
+
     table.clear(self.Components)
 end
 
+-- Build and cache the parts list for UseBoundingBox objects.
+-- Reconnects on DescendantAdded/Removing so the cache stays fresh
+-- without calling GetDescendants every frame (a major jitter source).
+local function buildPartsCache(box)
+    box._cachedParts = {}
+    for _, v in ipairs(box.Object:GetDescendants()) do
+        if v:IsA("BasePart") then
+            table.insert(box._cachedParts, v)
+        end
+    end
+
+    box._partsConnections = {}
+
+    table.insert(box._partsConnections,
+        box.Object.DescendantAdded:Connect(function(d)
+            if d:IsA("BasePart") then
+                table.insert(box._cachedParts, d)
+            end
+        end)
+    )
+
+    table.insert(box._partsConnections,
+        box.Object.DescendantRemoving:Connect(function(d)
+            if d:IsA("BasePart") then
+                for i, p in ipairs(box._cachedParts) do
+                    if p == d then
+                        table.remove(box._cachedParts, i)
+                        break
+                    end
+                end
+            end
+        end)
+    )
+end
+
 function boxBase:Update()
-    -- NEW: Check if object still exists (works for pivot-only models)
     if not self.Object or not self.Object.Parent then return self:Remove() end
     local stackedY = 0
+
     -- || 1. SLOW CHECK (Throttled) || --
     if (tick() - self.LastCheckTime > ESP.CheckInterval) then
         self.LastCheckTime = tick()
 
-        -- Check Enabled
         local allow = true
-        if self.IsEnabled and (type(self.IsEnabled) == "string" and not ESP[self.IsEnabled] or type(self.IsEnabled) == "function" and not self:IsEnabled()) then 
-            allow = false 
+        if self.IsEnabled and (
+            type(self.IsEnabled) == "string"   and not ESP[self.IsEnabled] or
+            type(self.IsEnabled) == "function" and not self:IsEnabled()
+        ) then
+            allow = false
         end
         if self.Player and not ESP.TeamMates and ESP:IsTeamMate(self.Player) then allow = false end
         if self.Player and not ESP.Players then allow = false end
-        
+
         self.CachedEnabled = allow
 
-        -- Check Color
         if self.ColorDynamic then
             self.CachedColor = self:ColorDynamic()
         else
@@ -330,70 +414,63 @@ function boxBase:Update()
     end
 
     if not self.CachedEnabled then
-        self.isRenderable = false 
-        for _, comp in pairs(self.Components) do
-            if type(comp) == "table" then
-                for _, item in pairs(comp) do  -- pairs instead of ipairs
-                    if type(item) == "userdata" then item.Visible = false end
-                end
-            else
-                comp.Visible = false
-            end
-        end
+        self.isRenderable = false
+        hideAllComponents(self.Components)
         return
     end
-    
+
     -- || 2. FAST CHECK (Position only) || --
     local color = self.CachedColor
     self.current_color = color
-    self.isRenderable = true 
+    self.isRenderable  = true
 
-    -- NEW: Get CFrame using pivot or parts
-    local cf, size = getObjectCFrameAndSize(self.Object, self.Size, self.PrimaryPart)
+    local cf, size = getObjectCFrameAndSize(
+        self.Object,
+        self.Size,
+        self.PrimaryPart,
+        self.UseBoundingBox,
+        self.UseBoundingBox and self._cachedParts or nil
+    )
 
     if not cf then
         self.isRenderable = false
-        for _, comp in pairs(self.Components) do
-            if type(comp) == "table" then
-                for _, item in pairs(comp) do  -- pairs instead of ipairs
-                    if type(item) == "userdata" then item.Visible = false end
-                end
-            else
-                comp.Visible = false
-            end
-        end
+        hideAllComponents(self.Components)
         return
     end
 
     self.distance = (cam.CFrame.Position - cf.Position).Magnitude
 
-    -- World To Screen
     local screenPos, onScreen = cam:WorldToViewportPoint(cf.Position)
     if screenPos.Z < 0 then onScreen = false end
-    
+
     local settings = self.Player and ESP.Player or ESP.Instance
 
-    -- Offscreen Arrows
+    -- Off-Screen Arrows
     local showArrows = settings.OffScreenArrows and not onScreen
-    self.Components.Arrow.Visible = showArrows
+    self.Components.Arrow.Visible        = showArrows
     self.Components.ArrowOutline.Visible = showArrows
     if showArrows then
-        local direction = (Vector2.new(screenPos.X, screenPos.Y) - cam.ViewportSize / 2).Unit
-        local radius = math.min(cam.ViewportSize.X, cam.ViewportSize.Y) / 2 * (ESP.OffScreenArrowRadius / 150)
-        local center = cam.ViewportSize / 2
-        local arrow = self.Components.Arrow
-        arrow.PointA = center + direction * radius
-        arrow.PointB = arrow.PointA - rotateVector(direction, 0.45) * ESP.OffScreenArrowSize
-        arrow.PointC = arrow.PointA - rotateVector(direction, -0.45) * ESP.OffScreenArrowSize
-        arrow.Color = color
-        local arrowOutline = self.Components.ArrowOutline
-        arrowOutline.PointA, arrowOutline.PointB, arrowOutline.PointC = arrow.PointA, arrow.PointB, arrow.PointC
-        arrowOutline.Color = Color3.new(0, 0, 0)
-        
+        local direction = (Vector2.new(screenPos.X, screenPos.Y) - cam.ViewportSize * 0.5).Unit
+        local radius    = math.min(cam.ViewportSize.X, cam.ViewportSize.Y) * 0.5 * (ESP.OffScreenArrowRadius / 150)
+        local center    = cam.ViewportSize * 0.5
+        local arrow     = self.Components.Arrow
+        arrow.PointA    = center + direction * radius
+        arrow.PointB    = arrow.PointA - rotateVector(direction,  0.45) * ESP.OffScreenArrowSize
+        arrow.PointC    = arrow.PointA - rotateVector(direction, -0.45) * ESP.OffScreenArrowSize
+        arrow.Color     = color
+        local arrowOutline     = self.Components.ArrowOutline
+        arrowOutline.PointA    = arrow.PointA
+        arrowOutline.PointB    = arrow.PointB
+        arrowOutline.PointC    = arrow.PointC
+        arrowOutline.Color     = Color3.new(0, 0, 0)
+
+        -- FIX: was ipairs, missed CustomTexts dict
         for name, comp in pairs(self.Components) do
             if name ~= "Arrow" and name ~= "ArrowOutline" then
                 if type(comp) == "table" then
-                    for _, c in ipairs(comp) do c.Visible = false end
+                    for _, c in pairs(comp) do
+                        if type(c) == "userdata" then c.Visible = false end
+                    end
                 else
                     comp.Visible = false
                 end
@@ -404,106 +481,120 @@ function boxBase:Update()
 
     local corners = calculateCorners(cf, size)
     if not corners then
-        for _, comp in pairs(self.Components) do
-            if type(comp) == "table" then
-                for _, item in pairs(comp) do  -- pairs instead of ipairs
-                    if type(item) == "userdata" then item.Visible = false end
-                end
-            else
-                comp.Visible = false
-            end
-        end
+        hideAllComponents(self.Components)
         return
     end
 
     local topLeft, bottomRight = corners.topLeft, corners.bottomRight
-    local topRight = Vector2.new(bottomRight.X, topLeft.Y)
+    local topRight  = Vector2.new(bottomRight.X, topLeft.Y)
     local bottomLeft = Vector2.new(topLeft.X, bottomRight.Y)
 
+    -- 3D Box
     local show3DBox = settings.Boxes3D and corners.onScreen
     for i, line in ipairs(self.Components.Box3D) do
         line.Visible = show3DBox
         if show3DBox then
             line.Color = color
-            local edgeStart, edgeEnd = CUBE_EDGES[i * 2 - 1], CUBE_EDGES[i * 2]
+            local edgeStart = CUBE_EDGES[i * 2 - 1]
+            local edgeEnd   = CUBE_EDGES[i * 2]
             line.From = corners.vertices[edgeStart]
-            line.To = corners.vertices[edgeEnd]
+            line.To   = corners.vertices[edgeEnd]
         end
     end
 
+    -- 2D Box
     local show2DBox = settings.Boxes and not show3DBox and corners.onScreen
     self.Components.Quad.Visible = show2DBox
     if show2DBox then
-        self.Components.Quad.PointA = topRight; self.Components.Quad.PointB = topLeft; self.Components.Quad.PointC = bottomLeft; self.Components.Quad.PointD = bottomRight
-        self.Components.Quad.Color = color
+        self.Components.Quad.PointA = topRight
+        self.Components.Quad.PointB = topLeft
+        self.Components.Quad.PointC = bottomLeft
+        self.Components.Quad.PointD = bottomRight
+        self.Components.Quad.Color  = color
     end
 
-    local humanoid = self.Object and self.Object:FindFirstChildOfClass("Humanoid")
+    -- Health Bar
+    local humanoid  = self.Object and self.Object:FindFirstChildOfClass("Humanoid")
     local showHealth = not not (settings.HealthBars and humanoid and corners.onScreen)
-    self.Components.HealthBar.Visible, self.Components.HealthBarOutline.Visible = showHealth, showHealth
-    self.Components.HealthText.Visible = showHealth and settings.HealthText
+    self.Components.HealthBar.Visible        = showHealth
+    self.Components.HealthBarOutline.Visible = showHealth
+    self.Components.HealthText.Visible       = showHealth and settings.HealthText
     if showHealth then
         local health, maxHealth = humanoid.Health, humanoid.MaxHealth
-        local healthPercent = math.clamp(health / maxHealth, 0, 1)
+        local healthPercent     = math.clamp(health / maxHealth, 0, 1)
         local HEALTH_BAR_OFFSET = Vector2.new(5, 0)
-        local barTop, barBottom = topLeft - HEALTH_BAR_OFFSET, bottomLeft - HEALTH_BAR_OFFSET
-        self.Components.HealthBarOutline.From = barTop - Vector2.new(0, 1); self.Components.HealthBarOutline.To = barBottom + Vector2.new(0, 1)
-        self.Components.HealthBar.To = barBottom; self.Components.HealthBar.From = barBottom:Lerp(barTop, healthPercent)
+        local barTop    = topLeft   - HEALTH_BAR_OFFSET
+        local barBottom = bottomLeft - HEALTH_BAR_OFFSET
+        self.Components.HealthBarOutline.From = barTop   - Vector2.new(0, 1)
+        self.Components.HealthBarOutline.To   = barBottom + Vector2.new(0, 1)
+        self.Components.HealthBar.To    = barBottom
+        self.Components.HealthBar.From  = barBottom:Lerp(barTop, healthPercent)
         self.Components.HealthBar.Color = Color3.fromHSV(0.33 * healthPercent, 1, 1)
         if settings.HealthText then
-            local healthText = self.Components.HealthText
-            healthText.Text = math.floor(health) .. " HP"
-            healthText.Position = self.Components.HealthBar.From - Vector2.new(healthText.TextBounds.X + 3, healthText.TextBounds.Y / 2)
+            local healthText    = self.Components.HealthText
+            healthText.Text     = math.floor(health) .. " HP"
+            healthText.Position = self.Components.HealthBar.From
+                - Vector2.new(healthText.TextBounds.X + 3, healthText.TextBounds.Y * 0.5)
             healthText.Color = color
         end
     end
 
-    local nameText = self.Components.Name; nameText.Visible = settings.Names and corners.onScreen
+    -- Name
+    local nameText  = self.Components.Name
+    nameText.Visible = settings.Names and corners.onScreen
     if nameText.Visible then
-        nameText.Position = (topLeft + topRight) / 2 - Vector2.new(0, nameText.TextBounds.Y) - NAME_OFFSET
-        nameText.Text = self.RawName or self.Name
+        nameText.Position = (topLeft + topRight) * 0.5
+            - Vector2.new(0, nameText.TextBounds.Y) - NAME_OFFSET
+        nameText.Text  = self.RawName or self.Name
         nameText.Color = color
     end
 
-    local distText = self.Components.Distance
+    -- Distance
+    local distText   = self.Components.Distance
     distText.Visible = settings.Distance and corners.onScreen
     if distText.Visible then
-        distText.Position = (bottomLeft + bottomRight) / 2 + DISTANCE_OFFSET
-        distText.Text = math.floor((cam.CFrame.p - cf.p).magnitude) .. "m"
-        distText.Color = color
+        distText.Position = (bottomLeft + bottomRight) * 0.5 + DISTANCE_OFFSET
+        distText.Text     = math.floor((cam.CFrame.p - cf.p).Magnitude) .. "m"
+        distText.Color    = color
         stackedY = stackedY + distText.TextBounds.Y + 2
     end
-    
+
+    -- Weapon
     local weaponText = self.Components.Weapon
     local weaponName = self.Player and ESP.Overrides.GetWeapon and ESP.Overrides.GetWeapon(self.Player)
     weaponText.Visible = not not (settings.Weapon and weaponName and corners.onScreen)
     if weaponText.Visible then
-        weaponText.Position = (bottomLeft + bottomRight) / 2 + DISTANCE_OFFSET + Vector2.new(0, stackedY)
-        weaponText.Text = weaponName
-        weaponText.Color = color
+        weaponText.Position = (bottomLeft + bottomRight) * 0.5 + DISTANCE_OFFSET + Vector2.new(0, stackedY)
+        weaponText.Text     = weaponName
+        weaponText.Color    = color
         stackedY = stackedY + weaponText.TextBounds.Y + 2
     end
 
+    -- Custom Texts
     for _, textDef in ipairs(ESP.CustomTexts) do
         local comp = self.Components.CustomTexts and self.Components.CustomTexts[textDef.id]
         if not comp then continue end
-    
-        local value = textDef.enabled and corners.onScreen and textDef.getValue and textDef.getValue(self.Player, self.Object)
+
+        local value = textDef.enabled and corners.onScreen
+            and textDef.getValue and textDef.getValue(self.Player, self.Object)
         comp.Visible = not not value
         if comp.Visible then
-            comp.Text = tostring(value)
-            comp.Color = textDef.getColor and textDef.getColor(self.Player, self.Object) or color
-            comp.Size = textDef.size or 19
-            comp.Position = (bottomLeft + bottomRight) / 2 + DISTANCE_OFFSET + Vector2.new(0, stackedY)
+            comp.Text     = tostring(value)
+            comp.Color    = textDef.getColor and textDef.getColor(self.Player, self.Object) or color
+            comp.Size     = textDef.size or 19
+            comp.Position = (bottomLeft + bottomRight) * 0.5 + DISTANCE_OFFSET + Vector2.new(0, stackedY)
             stackedY = stackedY + comp.TextBounds.Y + 2
         end
     end
-    
 
+    -- Tracer
     if settings.Tracers then
         local TorsoPos, Vis6 = cam:WorldToViewportPoint(cf.p)
         if Vis6 then
-            self.Components.Tracer.Visible = true; self.Components.Tracer.From = Vector2.new(TorsoPos.X, TorsoPos.Y); self.Components.Tracer.To = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / ESP.AttachShift); self.Components.Tracer.Color = color
+            self.Components.Tracer.Visible = true
+            self.Components.Tracer.From    = Vector2.new(TorsoPos.X, TorsoPos.Y)
+            self.Components.Tracer.To      = Vector2.new(cam.ViewportSize.X * 0.5, cam.ViewportSize.Y / ESP.AttachShift)
+            self.Components.Tracer.Color   = color
         else
             self.Components.Tracer.Visible = false
         end
@@ -514,97 +605,110 @@ end
 
 function ESP:Add(obj, options)
     if self:GetBox(obj) then self:GetBox(obj):Remove() end
-    
+
     options = options or {}
     local customSize = options.Size or self.BoxSize
-    
-    -- NEW: Determine PrimaryPart or create virtual part
+
     local primaryPart = options.PrimaryPart
     local virtualPart = nil
-    
+
     if not primaryPart and options.UsePivot then
         if obj:IsA("Model") then
-            -- Check if model has any parts
             local hasParts = false
             for _, v in ipairs(obj:GetDescendants()) do
-                if v:IsA("BasePart") then
-                    hasParts = true
-                    break
-                end
+                if v:IsA("BasePart") then hasParts = true; break end
             end
-            
+
             if not hasParts and ESP.CreateVirtualParts then
-                -- Create invisible part at pivot position
-                virtualPart = Instance.new("Part")
-                virtualPart.Size = customSize
-                virtualPart.CFrame = obj:GetPivot()
+                virtualPart          = Instance.new("Part")
+                virtualPart.Size     = customSize
+                virtualPart.CFrame   = obj:GetPivot()
                 virtualPart.Anchored = true
-                virtualPart.CanCollide = false
+                virtualPart.CanCollide   = false
                 virtualPart.Transparency = 1
-                virtualPart.Parent = obj
-                primaryPart = virtualPart
+                virtualPart.Parent   = obj
+                primaryPart          = virtualPart
             end
         end
     end
-    
+
     if not primaryPart and not options.UsePivot then
         if obj.ClassName == "Model" then
-            primaryPart = obj.PrimaryPart or obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChildWhichIsA("BasePart")
+            primaryPart = obj.PrimaryPart
+                or obj:FindFirstChild("HumanoidRootPart")
+                or obj:FindFirstChildWhichIsA("BasePart")
         elseif obj:IsA("BasePart") then
             primaryPart = obj
         end
     end
-    
-    local box = setmetatable({ 
-        Name = options.Name or obj.Name, 
-        Type = "Box", 
-        Color = options.Color, 
-        Size = customSize,
-        Object = obj, 
-        Player = options.Player or Players:GetPlayerFromCharacter(obj), 
-        PrimaryPart = primaryPart,
-        VirtualPart = virtualPart, -- NEW: Store reference to virtual part
-        Components = {}, 
-        IsEnabled = options.IsEnabled, 
-        Temporary = options.Temporary, 
-        ColorDynamic = options.ColorDynamic,
-        NameDynamic = options.NameDynamic,
-        RenderInNil = options.RenderInNil,
-        
-        LastCheckTime = 0,
-        CachedEnabled = true,
-        CachedColor = options.Color or ESP.Color,
-        RawName = options.Name
+
+    local box = setmetatable({
+        Name           = options.Name or obj.Name,
+        Type           = "Box",
+        Color          = options.Color,
+        Size           = customSize,
+        Object         = obj,
+        Player         = options.Player or Players:GetPlayerFromCharacter(obj),
+        PrimaryPart    = primaryPart,
+        VirtualPart    = virtualPart,
+        UseBoundingBox = options.UseBoundingBox, -- NEW
+        Components     = {},
+        IsEnabled      = options.IsEnabled,
+        Temporary      = options.Temporary,
+        ColorDynamic   = options.ColorDynamic,
+        NameDynamic    = options.NameDynamic,
+        RenderInNil    = options.RenderInNil,
+
+        LastCheckTime  = 0,
+        CachedEnabled  = true,
+        CachedColor    = options.Color or ESP.Color,
+        RawName        = options.Name,
     }, boxBase)
 
-    box.Components["Quad"] = Draw("Quad", { Thickness = ESP.Thickness, Transparency = 1, Filled = false })
-    box.Components["Name"] = Draw("Text", { Center = true, Outline = true, Size = 19 })
-    box.Components["Distance"] = Draw("Text", { Center = true, Outline = true, Size = 19 })
-    
-    box.Components["CustomTexts"] = {}
+    -- Build parts cache for bounding box objects to avoid GetDescendants every frame
+    if options.UseBoundingBox then
+        buildPartsCache(box)
+    end
+
+    box.Components["Quad"]            = Draw("Quad", { Thickness = ESP.Thickness, Transparency = 1, Filled = false })
+    box.Components["Name"]            = Draw("Text", { Center = true, Outline = true, Size = 19 })
+    box.Components["Distance"]        = Draw("Text", { Center = true, Outline = true, Size = 19 })
+    box.Components["CustomTexts"]     = {}
     for _, textDef in ipairs(ESP.CustomTexts) do
         box.Components.CustomTexts[textDef.id] = Draw("Text", { Center = true, Outline = true, Size = textDef.size or 19 })
     end
-    
-    box.Components["Tracer"] = Draw("Line", { Thickness = ESP.Thickness, Transparency = 1 })
-    box.Components["Weapon"] = Draw("Text", {Center = true, Outline = true, Size = 19})
-    box.Components["HealthBarOutline"] = Draw("Line", { Thickness = 5, Color = Color3.new(0,0,0), ZIndex = 1 })
-    box.Components["HealthBar"] = Draw("Line", { Thickness = 3, ZIndex = 2 })
-    box.Components["HealthText"] = Draw("Text", { Outline = true, Size = 16 })
-    box.Components["Box3D"] = {}
-    for i = 1, 12 do table.insert(box.Components.Box3D, Draw("Line", { Thickness = ESP.Thickness })) end
-    box.Components["Arrow"] = Draw("Triangle", {Filled = true})
-    box.Components["ArrowOutline"] = Draw("Triangle", {Thickness = 3, Filled = false})
+    box.Components["Tracer"]          = Draw("Line", { Thickness = ESP.Thickness, Transparency = 1 })
+    box.Components["Weapon"]          = Draw("Text", { Center = true, Outline = true, Size = 19 })
+    box.Components["HealthBarOutline"]= Draw("Line", { Thickness = 5, Color = Color3.new(0,0,0), ZIndex = 1 })
+    box.Components["HealthBar"]       = Draw("Line", { Thickness = 3, ZIndex = 2 })
+    box.Components["HealthText"]      = Draw("Text", { Outline = true, Size = 16 })
+    box.Components["Box3D"]           = {}
+    for i = 1, 12 do
+        table.insert(box.Components.Box3D, Draw("Line", { Thickness = ESP.Thickness }))
+    end
+    box.Components["Arrow"]           = Draw("Triangle", { Filled = true })
+    box.Components["ArrowOutline"]    = Draw("Triangle", { Thickness = 3, Filled = false })
 
     self.Objects[obj] = box
-    obj.AncestryChanged:Connect(function(_, parent) if parent == nil and ESP.AutoRemove ~= false then box:Remove() end end)
-    local hum = obj:FindFirstChildOfClass("Humanoid"); if hum then hum.Died:Connect(function() if ESP.AutoRemove ~= false then box:Remove() end end) end
+
+    obj.AncestryChanged:Connect(function(_, parent)
+        if parent == nil and ESP.AutoRemove ~= false then box:Remove() end
+    end)
+
+    local hum = obj:FindFirstChildOfClass("Humanoid")
+    if hum then
+        hum.Died:Connect(function()
+            if ESP.AutoRemove ~= false then box:Remove() end
+        end)
+    end
+
     return box
 end
 
+-- FIX: nil guard for player lookup before accessing p.Name
 local function CharAdded(char)
     local p = Players:GetPlayerFromCharacter(char)
-    if not p then return end  -- ADD THIS
+    if not p then return end
     local hrp = char:WaitForChild("HumanoidRootPart", 5)
     if not hrp then return end
     ESP:Add(char, { Name = p.Name, Player = p, PrimaryPart = hrp })
@@ -616,26 +720,27 @@ local function PlayerAdded(p)
         coroutine.wrap(CharAdded)(p.Character)
     end
 end
+
 Players.PlayerAdded:Connect(PlayerAdded)
-for i, v in pairs(Players:GetPlayers()) do
+for _, v in pairs(Players:GetPlayers()) do
     if v ~= plr then PlayerAdded(v) end
 end
 
--- || OPTIMIZED RENDER LOOP STARTS HERE || --
-local UPDATE_TICK = 0
-local SORT_DELAY = 0.1
-local lastSortTime = 0
+-- || OPTIMIZED RENDER LOOP || --
+local UPDATE_TICK   = 0
+local SORT_DELAY    = 0.1
+local lastSortTime  = 0
 local lastRenderTime = 0
 
 RunService.RenderStepped:Connect(function()
     if tick() - lastRenderTime < ESP.UpdateInterval then return end
     lastRenderTime = tick()
     cam = Workspace.CurrentCamera
-    
+
     if ESP.Enabled then
         for _, v in pairs(ESP.Objects) do
             if v.Update then
-                local s, e = pcall(v.Update, v)
+                pcall(v.Update, v)
             end
         end
     else
@@ -648,34 +753,34 @@ RunService.RenderStepped:Connect(function()
     UPDATE_TICK = tick()
     if ESP.HighlightBudget > 0 then
         local renderableTargets = {}
-        
+
         for _, espBox in pairs(ESP.Objects) do
             local settings = espBox.Player and ESP.Player or ESP.Instance
             if espBox.isRenderable and settings.Highlights and espBox.distance <= ESP.HighlightDistance then
                 table.insert(renderableTargets, espBox)
             end
         end
-        
+
         if UPDATE_TICK - lastSortTime > SORT_DELAY then
-            table.sort(renderableTargets, function(a,b) return a.distance < b.distance end)
+            table.sort(renderableTargets, function(a, b) return a.distance < b.distance end)
             lastSortTime = UPDATE_TICK
         end
-        
+
         for i = 1, #highlightPool do
             local h = highlightPool[i]
             local t = renderableTargets[i]
-            
+
             if t and i <= ESP.HighlightBudget then
                 if h.Adornee ~= t.Object then h.Adornee = t.Object end
                 local targetColor = ESP.HighlightFillColor or t.current_color
-                if h.FillColor ~= targetColor then h.FillColor = targetColor end
-                if h.FillTransparency ~= ESP.HighlightFillTransparency then h.FillTransparency = ESP.HighlightFillTransparency end
-                if h.OutlineColor ~= ESP.HighlightOutlineColor then h.OutlineColor = ESP.HighlightOutlineColor end
+                if h.FillColor         ~= targetColor                   then h.FillColor         = targetColor end
+                if h.FillTransparency  ~= ESP.HighlightFillTransparency then h.FillTransparency  = ESP.HighlightFillTransparency end
+                if h.OutlineColor      ~= ESP.HighlightOutlineColor     then h.OutlineColor      = ESP.HighlightOutlineColor end
                 if not h.Enabled then h.Enabled = true end
             else
-                if h.Enabled then 
-                    h.Enabled = false 
-                    h.Adornee = nil
+                if h.Enabled then
+                    h.Enabled  = false
+                    h.Adornee  = nil
                 end
             end
         end
@@ -685,6 +790,5 @@ RunService.RenderStepped:Connect(function()
         end
     end
 end)
--- || OPTIMIZED RENDER LOOP ENDS HERE || --
 
 return ESP
